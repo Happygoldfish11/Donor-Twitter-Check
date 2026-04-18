@@ -7,7 +7,9 @@ import streamlit as st
 import time
 import pandas as pd
 import sys, os
-sys.path.insert(0, os.path.dirname(__file__))
+_here = os.path.dirname(os.path.abspath(__file__))
+if _here not in sys.path:
+    sys.path.insert(0, _here)
 
 from src.matcher import Person, find_twitter
 from src.spreadsheet import load_persons, write_results
