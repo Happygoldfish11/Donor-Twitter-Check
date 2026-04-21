@@ -84,6 +84,8 @@ class MatchResult:
     score_breakdown: dict = field(default_factory=dict)
     search_query: str = ""
     error: str = ""
+    keyword_hits: dict = field(default_factory=dict)   # keyword -> ["bio", "tweet: ..."]
+    keyword_flagged: bool = False
 
     @property
     def emoji(self) -> str:
@@ -331,6 +333,86 @@ def find_twitter(person: Person, anthropic_key="", serpapi_key="") -> MatchResul
 
 
 # =============================================================================
+# KEYWORD SCANNER
+# =============================================================================
+
+def scan_keywords(result: MatchResult, keywords: list, anthropic_key: str) -> MatchResult:
+    """
+    Given a MatchResult with a confirmed profile, ask Claude to fetch that
+    person's recent tweets and check both bio + tweets for each keyword.
+    Populates result.keyword_hits and result.keyword_flagged in-place.
+    """
+    if not result.profile or not keywords or not anthropic_key:
+        return result
+
+    import anthropic as _anthropic
+    client = _anthropic.Anthropic(api_key=anthropic_key)
+
+    handle   = result.profile.handle
+    bio_text = result.profile.bio or ""
+    kw_list  = ", ".join(f'"{k}"' for k in keywords)
+
+    prompt = f"""You are scanning a Twitter/X profile for specific keywords.
+
+Profile: {handle}
+Bio text already retrieved: "{bio_text}"
+
+Your tasks:
+1. Search the web for recent tweets by {handle} — try queries like:
+   - site:twitter.com {handle} tweets
+   - {handle} twitter recent posts
+   Collect up to 20 recent tweet texts if available.
+
+2. Check BOTH the bio AND the tweets for these keywords (case-insensitive): {kw_list}
+
+3. Return ONLY a JSON object with this exact structure:
+{{
+  "bio_hits": ["keyword1", "keyword2"],
+  "tweet_hits": {{
+    "keyword1": ["exact tweet snippet containing keyword1 (max 100 chars)"],
+    "keyword2": ["exact tweet snippet..."]
+  }},
+  "tweets_found": true
+}}
+
+- bio_hits: list of keywords found anywhere in the bio
+- tweet_hits: for each keyword found in tweets, list up to 3 short snippets as evidence
+- tweets_found: true if you found any recent tweets, false if private or inactive
+
+Return ONLY the JSON, no markdown, no other text."""
+
+    try:
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1500,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        full_text = "".join(b.text for b in resp.content if hasattr(b, "text"))
+        clean = re.sub(r"```(?:json)?", "", full_text).strip().strip("`").strip()
+        m = re.search(r'\{.*\}', clean, re.DOTALL)
+        if m:
+            data = json.loads(m.group(0))
+            hits = {}
+            for kw in data.get("bio_hits", []):
+                kw_l = kw.lower()
+                hits.setdefault(kw_l, [])
+                if "bio" not in hits[kw_l]:
+                    hits[kw_l].append("bio")
+            for kw, snippets in data.get("tweet_hits", {}).items():
+                kw_l = kw.lower()
+                hits.setdefault(kw_l, [])
+                for s in snippets[:3]:
+                    hits[kw_l].append(f'tweet: "{str(s)[:100]}"')
+            result.keyword_hits    = hits
+            result.keyword_flagged = len(hits) > 0
+    except Exception as e:
+        logger.warning(f"Keyword scan error for {handle}: {e}")
+
+    return result
+
+
+# =============================================================================
 # SPREADSHEET I/O
 # =============================================================================
 
@@ -401,7 +483,8 @@ def write_results(original_file, results):
 
     orig_cols = ws.max_column
     new_headers = ["Twitter Handle","Profile URL","Confidence","Score (0-100)",
-                   "Display Name","Bio","Location","Score Breakdown"]
+                   "Display Name","Bio","Location","Score Breakdown",
+                   "Keyword Flagged","Keywords Matched","Keyword Evidence"]
     hfont = Font(color="FFFFFF", bold=True, name="Calibri", size=10)
 
     for c in range(1, orig_cols + 1):
@@ -426,6 +509,11 @@ def write_results(original_file, results):
             cell.alignment = Alignment(vertical="center")
         p = result.profile
         breakdown_str = " | ".join(f"{k}: +{v}" for k, v in result.score_breakdown.items())
+        kw_flagged  = "YES" if result.keyword_flagged else ("N/A" if not result.keyword_hits and not result.profile else "NO")
+        kw_matched  = ", ".join(result.keyword_hits.keys()) if result.keyword_hits else ""
+        kw_evidence = " | ".join(
+            f"{kw}: {'; '.join(locs)}" for kw, locs in result.keyword_hits.items()
+        ) if result.keyword_hits else ""
         vals = [
             p.handle if p else "",
             p.profile_url if p else "",
@@ -435,6 +523,9 @@ def write_results(original_file, results):
             (p.bio[:200] + "…") if p and len(p.bio) > 200 else (p.bio if p else ""),
             p.location if p else "",
             breakdown_str,
+            kw_flagged,
+            kw_matched,
+            kw_evidence,
         ]
         for i, val in enumerate(vals, start=orig_cols + 1):
             cell = ws.cell(row_idx, i, val)
@@ -442,7 +533,7 @@ def write_results(original_file, results):
             cell.alignment = Alignment(vertical="center", wrap_text=(i > orig_cols + 2))
         ws.row_dimensions[row_idx].height = 18
 
-    for offset, width in enumerate([18,35,14,12,20,45,20,55], start=1):
+    for offset, width in enumerate([18,35,14,12,20,45,20,55,10,30,60], start=1):
         ws.column_dimensions[get_column_letter(orig_cols + offset)].width = width
 
     if "Summary" in wb.sheetnames: del wb["Summary"]
@@ -514,10 +605,10 @@ html, body, [class*="css"] { font-family: 'IBM Plex Sans', sans-serif; }
 
 st.markdown("""
 <div class="hero-wrap">
-    <div class="tag">v1.0 · powered by Claude web search</div>
+    <div class="tag">v1.1 · profile finder + keyword scanner</div>
     <div class="hero-title">Twitter / X Profile Finder</div>
     <p class="hero-sub">Upload a spreadsheet of names, addresses, and employers —
-    get back matched Twitter profiles with confidence scores.</p>
+    get back matched Twitter profiles with confidence scores, then scan bios and tweets for keywords.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -580,7 +671,27 @@ if uploaded:
     st.markdown(f"**{len(persons)} people loaded.** Preview:")
     st.dataframe(df_orig.head(5), use_container_width=True, hide_index=True)
 
-    st.markdown("### 2. Run the search")
+    # ── Keyword scanner UI ───────────────────────────────────────────────────
+    st.markdown("### 2. Set keywords to scan (optional)")
+    st.markdown('''<div class="info-box">
+Enter words or phrases to flag — e.g. <b>MAGA, Trump, January 6, Stop the Steal</b>.
+The app will check each matched profile's <b>bio AND recent tweets</b> for these terms.
+Leave blank to skip keyword scanning.
+</div>''', unsafe_allow_html=True)
+
+    kw_input = st.text_input(
+        "Keywords (comma-separated)",
+        placeholder="e.g. MAGA, Trump, January 6, Stop the Steal",
+        label_visibility="collapsed",
+    )
+    keywords = [k.strip() for k in kw_input.split(",") if k.strip()] if kw_input else []
+
+    if keywords:
+        pills = " ".join(f'<span class="breakdown-pill" style="color:#fbbf24;background:#71350030;border:1px solid #d9770040">{k}</span>' for k in keywords)
+        st.markdown(f'<div style="margin:0.4rem 0">{pills}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="info-box">⚠️ Keyword scanning adds ~1 extra API call per matched profile. For 100 profiles at ~80% match rate, expect ~80 extra calls (~$1.20 extra cost).</div>', unsafe_allow_html=True)
+
+    st.markdown("### 3. Run the search")
     no_key = not anthropic_key and not serpapi_key
     if no_key:
         st.markdown('<div class="warn-box">⚠️ Add your Anthropic API key in the sidebar to enable search.</div>', unsafe_allow_html=True)
@@ -604,6 +715,14 @@ if uploaded:
                 f'<div class="info-box">Searching for <b>{person.full_name}</b> ({i+1} of {len(sample)})...</div>',
                 unsafe_allow_html=True)
             result = find_twitter(person, anthropic_key=anthropic_key, serpapi_key=serpapi_key)
+
+            # Keyword scan — only for profiles we actually found
+            if keywords and result.profile and result.confidence != "NO MATCH":
+                status_box.markdown(
+                    f'<div class="info-box">Scanning tweets for <b>{person.full_name}</b> ({result.profile.handle})...</div>',
+                    unsafe_allow_html=True)
+                result = scan_keywords(result, keywords, anthropic_key)
+
             results.append(result)
             progress.progress((i+1)/len(sample), text=f"{i+1}/{len(sample)} complete")
 
@@ -616,6 +735,16 @@ if uploaded:
                                if p else '<span style="color:#334155">—</span>')
                 bd_html = " ".join(f'<span class="breakdown-pill">{k.replace("_"," ")} +{v}</span>'
                                    for k, v in r.score_breakdown.items())
+                kw_flag_html = ""
+                if r.keyword_flagged:
+                    kw_pills = " ".join(
+                        f'<span class="breakdown-pill" style="color:#fbbf24;background:#71350030;border:1px solid #d9770040">⚑ {kw}</span>'
+                        for kw in r.keyword_hits.keys()
+                    )
+                    kw_flag_html = f'<div style="padding:0 1rem 0.4rem;font-size:0.72rem">🚩 <b style="color:#fbbf24">Keywords matched:</b> {kw_pills}</div>'
+                elif keywords and r.profile and r.confidence != "NO MATCH":
+                    kw_flag_html = '<div style="padding:0 1rem 0.4rem;font-size:0.72rem;color:#334155">✓ No keywords found</div>'
+
                 rows_html += f"""
 <div class="result-row">
   <span class="badge badge-{conf_cls}">{r.emoji} {r.confidence}</span>
@@ -624,7 +753,8 @@ if uploaded:
   <div style="flex:1"><div class="score-bar-wrap"><div class="score-bar" style="width:{r.score}%;background:{bar_color}"></div></div></div>
   <span class="score-num">{r.score}</span>
 </div>
-{f'<div style="padding:0 1rem 0.25rem;font-size:0.72rem;color:#475569">{bd_html}</div>' if bd_html else ''}"""
+{f'<div style="padding:0 1rem 0.25rem;font-size:0.72rem;color:#475569">{bd_html}</div>' if bd_html else ''}
+{kw_flag_html}"""
             live.markdown(rows_html, unsafe_allow_html=True)
             time.sleep(0.1)
 
@@ -632,6 +762,9 @@ if uploaded:
 
         counts = {"HIGH":0,"MEDIUM":0,"LOW":0,"NO MATCH":0}
         for r in results: counts[r.confidence] += 1
+        kw_flagged_count = sum(1 for r in results if r.keyword_flagged)
+
+        kw_metric = f'''<div class="metric"><div class="num" style="color:#fbbf24">{kw_flagged_count}</div><div class="lbl">Keyword hits</div></div>''' if keywords else ""
 
         st.markdown(f"""
 <div class="metric-row">
@@ -640,9 +773,10 @@ if uploaded:
   <div class="metric"><div class="num" style="color:#fbbf24">{counts['MEDIUM']}</div><div class="lbl">Medium</div></div>
   <div class="metric"><div class="num" style="color:#fb923c">{counts['LOW']}</div><div class="lbl">Low</div></div>
   <div class="metric"><div class="num" style="color:#f87171">{counts['NO MATCH']}</div><div class="lbl">No match</div></div>
+  {kw_metric}
 </div>""", unsafe_allow_html=True)
 
-        st.markdown("### 3. Download results")
+        st.markdown("### 4. Download results")
         uploaded.seek(0)
         out_buf  = write_results(uploaded, results)
         out_name = uploaded.name.replace(".csv","").replace(".xlsx","") + "_twitter_results.xlsx"
