@@ -96,8 +96,10 @@ class MatchResult:
 # CONFIDENCE SCORER
 # =============================================================================
 
-def _normalise(text: str) -> str:
-    return re.sub(r"[^a-z0-9 ]", " ", text.lower())
+def _normalise(text) -> str:
+    if not text:
+        return ""
+    return re.sub(r"[^a-z0-9 ]", " ", str(text).lower())
 
 
 def score_match(person: Person, profile: TwitterProfile):
@@ -105,8 +107,8 @@ def score_match(person: Person, profile: TwitterProfile):
     total = 0
 
     full       = person.full_name.lower()
-    disp       = profile.display_name.lower()
-    handle_c   = profile.handle.lstrip("@").lower()
+    disp       = (profile.display_name or "").lower()
+    handle_c   = (profile.handle or "").lstrip("@").lower()
     bio_norm   = _normalise(profile.bio)
     loc_norm   = _normalise(profile.location)
     combined   = bio_norm + " " + loc_norm
