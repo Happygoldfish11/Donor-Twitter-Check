@@ -705,49 +705,78 @@ Leave blank to skip keyword scanning.
     with col2:
         dry = st.button("🧪 Test (first 3)", use_container_width=True, disabled=no_key)
 
-    if run or dry:
-        sample  = persons[:3] if dry else persons
-        results = []
-        progress   = st.progress(0, text="Starting...")
-        status_box = st.empty()
-        live       = st.empty()
+    # ── Session state for checkpointing ─────────────────────────────────────
+    BATCH_SIZE = 10  # ~30-40s per batch, well under Streamlit's 60s timeout
 
-        for i, person in enumerate(sample):
+    if "results"      not in st.session_state: st.session_state.results      = []
+    if "next_index"   not in st.session_state: st.session_state.next_index   = 0
+    if "run_keywords" not in st.session_state: st.session_state.run_keywords = []
+    if "total_sample" not in st.session_state: st.session_state.total_sample = []
+
+    # Fresh run
+    if run or dry:
+        st.session_state.results      = []
+        st.session_state.next_index   = 0
+        st.session_state.run_keywords = keywords
+        st.session_state.total_sample = persons[:3] if dry else persons
+
+    # Continue OR fresh run — process next batch
+    active_keywords = st.session_state.run_keywords
+    sample          = st.session_state.total_sample
+    start_idx       = st.session_state.next_index
+
+    if (run or dry or st.session_state.get("continuing")) and sample:
+        st.session_state.continuing = False
+        batch      = sample[start_idx : start_idx + BATCH_SIZE]
+        progress   = st.progress(0, text="Starting batch...")
+        status_box = st.empty()
+
+        for i, person in enumerate(batch):
+            global_i = start_idx + i
             status_box.markdown(
-                f'<div class="info-box">Searching for <b>{person.full_name}</b> ({i+1} of {len(sample)})...</div>',
+                f'<div class="info-box">Searching <b>{person.full_name}</b> ({global_i+1} of {len(sample)})...</div>',
                 unsafe_allow_html=True)
             result = find_twitter(person, anthropic_key=anthropic_key, serpapi_key=serpapi_key)
 
-            # Keyword scan — only for profiles we actually found
-            if keywords and result.profile and result.confidence != "NO MATCH":
+            if active_keywords and result.profile and result.confidence != "NO MATCH":
                 status_box.markdown(
-                    f'<div class="info-box">Scanning tweets for <b>{person.full_name}</b> ({result.profile.handle})...</div>',
+                    f'<div class="info-box">Scanning tweets for <b>{person.full_name}</b>...</div>',
                     unsafe_allow_html=True)
-                result = scan_keywords(result, keywords, anthropic_key)
+                result = scan_keywords(result, active_keywords, anthropic_key)
 
-            results.append(result)
-            progress.progress((i+1)/len(sample), text=f"{i+1}/{len(sample)} complete")
+            st.session_state.results.append(result)
+            progress.progress((i+1)/len(batch), text=f"Batch: {i+1}/{len(batch)}")
+            time.sleep(0.1)
 
-            rows_html = ""
-            for r in results:
-                p = r.profile
-                conf_cls   = r.confidence.replace(" ","")
-                bar_color  = {"HIGH":"#4ade80","MEDIUM":"#fbbf24","LOW":"#fb923c","NO MATCH":"#f87171"}.get(r.confidence,"#6b7280")
-                handle_html = (f'<a class="handle-link" href="{p.profile_url}" target="_blank">{p.handle}</a>'
-                               if p else '<span style="color:#334155">—</span>')
-                bd_html = " ".join(f'<span class="breakdown-pill">{k.replace("_"," ")} +{v}</span>'
-                                   for k, v in r.score_breakdown.items())
-                kw_flag_html = ""
-                if r.keyword_flagged:
-                    kw_pills = " ".join(
-                        f'<span class="breakdown-pill" style="color:#fbbf24;background:#71350030;border:1px solid #d9770040">⚑ {kw}</span>'
-                        for kw in r.keyword_hits.keys()
-                    )
-                    kw_flag_html = f'<div style="padding:0 1rem 0.4rem;font-size:0.72rem">🚩 <b style="color:#fbbf24">Keywords matched:</b> {kw_pills}</div>'
-                elif keywords and r.profile and r.confidence != "NO MATCH":
-                    kw_flag_html = '<div style="padding:0 1rem 0.4rem;font-size:0.72rem;color:#334155">✓ No keywords found</div>'
+        st.session_state.next_index = start_idx + len(batch)
+        status_box.empty(); progress.empty()
 
-                rows_html += f"""
+    results    = st.session_state.results
+    sample     = st.session_state.total_sample
+    next_index = st.session_state.next_index
+    done       = next_index >= len(sample) if sample else True
+
+    if results:
+        # Live results table
+        rows_html = ""
+        for r in results:
+            p = r.profile
+            conf_cls   = r.confidence.replace(" ","")
+            bar_color  = {"HIGH":"#4ade80","MEDIUM":"#fbbf24","LOW":"#fb923c","NO MATCH":"#f87171"}.get(r.confidence,"#6b7280")
+            handle_html = (f'<a class="handle-link" href="{p.profile_url}" target="_blank">{p.handle}</a>'
+                           if p else '<span style="color:#334155">—</span>')
+            bd_html = " ".join(f'<span class="breakdown-pill">{k.replace("_"," ")} +{v}</span>'
+                               for k, v in r.score_breakdown.items())
+            kw_flag_html = ""
+            if r.keyword_flagged:
+                kw_pills = " ".join(
+                    f'<span class="breakdown-pill" style="color:#fbbf24;background:#71350030;border:1px solid #d9770040">⚑ {kw}</span>'
+                    for kw in r.keyword_hits.keys()
+                )
+                kw_flag_html = f'<div style="padding:0 1rem 0.4rem;font-size:0.72rem">🚩 <b style="color:#fbbf24">Keywords matched:</b> {kw_pills}</div>'
+            elif active_keywords and r.profile and r.confidence != "NO MATCH":
+                kw_flag_html = '<div style="padding:0 1rem 0.4rem;font-size:0.72rem;color:#334155">✓ No keywords found</div>'
+            rows_html += f"""
 <div class="result-row">
   <span class="badge badge-{conf_cls}">{r.emoji} {r.confidence}</span>
   <span class="person-name">{r.person.full_name}</span>
@@ -757,16 +786,28 @@ Leave blank to skip keyword scanning.
 </div>
 {f'<div style="padding:0 1rem 0.25rem;font-size:0.72rem;color:#475569">{bd_html}</div>' if bd_html else ''}
 {kw_flag_html}"""
-            live.markdown(rows_html, unsafe_allow_html=True)
-            time.sleep(0.1)
+        st.markdown(rows_html, unsafe_allow_html=True)
 
-        status_box.empty(); progress.empty()
+        # Progress indicator
+        if sample:
+            st.markdown(
+                f'<div class="info-box">✓ {len(results)} of {len(sample)} complete — '+
+                (f'<b>all done!</b>' if done else f'{len(sample)-len(results)} remaining')+
+                '</div>',
+                unsafe_allow_html=True)
 
+        # Continue button if not done
+        if not done:
+            if st.button(f"▶ Continue — next {min(BATCH_SIZE, len(sample)-next_index)} names",
+                         type="primary", use_container_width=True):
+                st.session_state.continuing = True
+                st.rerun()
+
+        # Summary + download (always visible once we have any results)
         counts = {"HIGH":0,"MEDIUM":0,"LOW":0,"NO MATCH":0}
         for r in results: counts[r.confidence] += 1
         kw_flagged_count = sum(1 for r in results if r.keyword_flagged)
-
-        kw_metric = f'''<div class="metric"><div class="num" style="color:#fbbf24">{kw_flagged_count}</div><div class="lbl">Keyword hits</div></div>''' if keywords else ""
+        kw_metric = f'''<div class="metric"><div class="num" style="color:#fbbf24">{kw_flagged_count}</div><div class="lbl">Keyword hits</div></div>''' if active_keywords else ""
 
         st.markdown(f"""
 <div class="metric-row">
@@ -779,15 +820,15 @@ Leave blank to skip keyword scanning.
 </div>""", unsafe_allow_html=True)
 
         st.markdown("### 4. Download results")
+        suffix = "" if done else f"_partial_{len(results)}of{len(sample)}"
         uploaded.seek(0)
         out_buf  = write_results(uploaded, results)
-        out_name = uploaded.name.replace(".csv","").replace(".xlsx","") + "_twitter_results.xlsx"
-        st.download_button("⬇️ Download Annotated Spreadsheet", data=out_buf,
-                           file_name=out_name,
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           use_container_width=True, type="primary")
-        if dry and len(persons) > 3:
-            st.info(f"Test run complete — click 'Find Twitter Profiles' to run all {len(persons)} people.")
+        out_name = uploaded.name.replace(".csv","").replace(".xlsx","") + f"{suffix}_twitter_results.xlsx"
+        st.download_button(
+            f"⬇️ Download {'Complete' if done else f'Partial ({len(results)}/{len(sample)})'} Results",
+            data=out_buf, file_name=out_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True, type="primary")
 
 else:
     st.markdown("""
